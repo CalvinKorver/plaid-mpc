@@ -43,7 +43,8 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS categories (
                 name    TEXT PRIMARY KEY,
-                parent  TEXT NOT NULL DEFAULT ''
+                parent  TEXT NOT NULL DEFAULT '',
+                deleted INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS plaid_category_map (
@@ -111,6 +112,20 @@ def init_db() -> None:
                 reason         TEXT,
                 model          TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS balance_snapshots (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapped_at TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                balance    REAL NOT NULL,
+                available  REAL,
+                currency   TEXT NOT NULL DEFAULT 'USD',
+                type       TEXT NOT NULL DEFAULT '',
+                subtype    TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshots_account_date
+                ON balance_snapshots (account_id, snapped_at);
         """)
 
         # For existing installations created before old_payee/old_category were added,
@@ -121,6 +136,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE rules ADD COLUMN old_category TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE categories ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -315,57 +334,72 @@ def apply_auto_categorization() -> int:
 
 
 def get_all_categories() -> list[dict]:
-    """Return all categories ordered by parent then name."""
+    """Return all non-deleted categories ordered by parent then name."""
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT name, parent FROM categories ORDER BY parent, name"
+            "SELECT name, parent FROM categories WHERE deleted = 0 ORDER BY parent, name"
         ).fetchall()
     return [dict(r) for r in rows]
 
 
 def add_category(name: str, parent: str = "") -> bool:
     """
-    Insert a new category. Returns False if the name already exists.
-    Raises ValueError if parent is non-empty and doesn't exist.
+    Insert a new category. Returns False if the name already exists (and is not soft-deleted).
+    If the name exists but was soft-deleted, un-deletes it and updates its parent.
+    Raises ValueError if parent is non-empty and doesn't exist or is soft-deleted.
     """
     with _conn() as conn:
         if parent:
-            exists = conn.execute(
-                "SELECT 1 FROM categories WHERE name = ?", (parent,)
+            row = conn.execute(
+                "SELECT deleted FROM categories WHERE name = ?", (parent,)
             ).fetchone()
-            if not exists:
+            if not row:
                 raise ValueError(f"Parent category '{parent}' does not exist")
-        try:
-            conn.execute(
-                "INSERT INTO categories (name, parent) VALUES (?, ?)",
-                (name, parent),
-            )
-            return True
-        except sqlite3.IntegrityError:
+            if row["deleted"]:
+                raise ValueError(f"Parent category '{parent}' has been deleted")
+        existing = conn.execute(
+            "SELECT deleted FROM categories WHERE name = ?", (name,)
+        ).fetchone()
+        if existing:
+            if existing["deleted"]:
+                conn.execute(
+                    "UPDATE categories SET deleted = 0, parent = ? WHERE name = ?",
+                    (parent, name),
+                )
+                return True
             return False
+        conn.execute(
+            "INSERT INTO categories (name, parent) VALUES (?, ?)",
+            (name, parent),
+        )
+        return True
 
 
 def remove_category(name: str) -> bool:
     """
-    Delete a sub-level category (one with a non-empty parent).
-    Raises ValueError if the category doesn't exist or is top-level.
-    Clears custom_category on transactions using it and deletes any budget for it.
-    Returns True if deleted.
+    Soft-delete a category. Historical transactions are preserved.
+    Also soft-deletes any children of a top-level category.
+    Deletes budgets for the category and any affected children.
+    Raises ValueError if the category doesn't exist or is already deleted.
+    Returns True on success.
     """
     with _conn() as conn:
         row = conn.execute(
-            "SELECT parent FROM categories WHERE name = ?", (name,)
+            "SELECT deleted FROM categories WHERE name = ?", (name,)
         ).fetchone()
         if not row:
             raise ValueError(f"Category '{name}' does not exist")
-        if not row["parent"]:
-            raise ValueError(f"Category '{name}' is a top-level category and cannot be removed here")
+        if row["deleted"]:
+            raise ValueError(f"Category '{name}' is already deleted")
+        # Soft-delete children first
         conn.execute(
-            "UPDATE transactions SET custom_category = NULL WHERE custom_category = ?",
+            "UPDATE categories SET deleted = 1 WHERE parent = ? AND deleted = 0",
             (name,),
         )
+        conn.execute("DELETE FROM budgets WHERE category IN (SELECT name FROM categories WHERE parent = ?)", (name,))
+        # Soft-delete the category itself
+        conn.execute("UPDATE categories SET deleted = 1 WHERE name = ?", (name,))
         conn.execute("DELETE FROM budgets WHERE category = ?", (name,))
-        conn.execute("DELETE FROM categories WHERE name = ?", (name,))
     return True
 
 
@@ -717,3 +751,195 @@ def apply_rules_to_new_transactions() -> int:
     for rule in rules:
         total += _apply_rule_row(rule)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Balance snapshots
+# ---------------------------------------------------------------------------
+
+def upsert_balance_snapshot(
+    account_id: str,
+    balance: float,
+    available: float | None,
+    currency: str,
+    account_type: str,
+    account_subtype: str,
+    snapped_at: str | None = None,
+) -> None:
+    """
+    Insert a balance snapshot row. Always inserts (no dedup) so every sync
+    creates a new snapshot, enabling historical net worth queries.
+    snapped_at defaults to the current UTC time if not provided.
+    """
+    ts = snapped_at or datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO balance_snapshots
+                (snapped_at, account_id, balance, available, currency, type, subtype)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ts, account_id, balance, available, currency, account_type, account_subtype),
+        )
+
+
+def get_week_spending(week_start: str, week_end: str) -> dict:
+    """
+    Aggregate spending for the date range [week_start, week_end] (inclusive).
+
+    Returns:
+        {
+            "total": float,                  # sum of debits (amount > 0), non-pending
+            "income_total": float,           # sum of credits (amount < 0) as a positive number
+            "by_day": {date_str: float},     # all 7 days zero-filled
+            "by_category": [                 # sorted by total desc
+                {
+                    "category": str,
+                    "total": float,
+                    "transactions": [        # top 3 per category by amount desc
+                        {"name": str, "merchant_name": str, "amount": float, "date": str}
+                    ]
+                }
+            ]
+        }
+    """
+    from datetime import date, timedelta
+
+    rows = query_transactions(week_start, week_end)
+
+    # Zero-fill all days in range
+    start = date.fromisoformat(week_start)
+    end = date.fromisoformat(week_end)
+    by_day: dict[str, float] = {}
+    cur = start
+    while cur <= end:
+        by_day[cur.isoformat()] = 0.0
+        cur += timedelta(days=1)
+
+    total = 0.0
+    income_total = 0.0
+    cat_totals: dict[str, float] = {}
+    cat_txs: dict[str, list[dict]] = {}
+
+    for r in rows:
+        if r.get("pending"):
+            continue
+        amt = r["amount"]
+        tx_date = r["date"]
+        category = r.get("custom_category") or r.get("plaid_category") or "Uncategorized"
+
+        if amt > 0:
+            total += amt
+            by_day[tx_date] = round(by_day.get(tx_date, 0.0) + amt, 2)
+            cat_totals[category] = round(cat_totals.get(category, 0.0) + amt, 2)
+            cat_txs.setdefault(category, []).append({
+                "name": r.get("name") or "",
+                "merchant_name": r.get("merchant_name") or "",
+                "amount": amt,
+                "date": tx_date,
+            })
+        elif amt < 0:
+            income_total += abs(amt)
+
+    by_category = []
+    for cat, cat_total in sorted(cat_totals.items(), key=lambda x: -x[1]):
+        txs = sorted(cat_txs[cat], key=lambda x: -x["amount"])[:3]
+        by_category.append({"category": cat, "total": cat_total, "transactions": txs})
+
+    return {
+        "total": round(total, 2),
+        "income_total": round(income_total, 2),
+        "by_day": {d: round(v, 2) for d, v in by_day.items()},
+        "by_category": by_category,
+    }
+
+
+def get_net_worth_history(week_start: str, week_end: str) -> dict:
+    """
+    Compute net worth at the start and end of the week using balance snapshots.
+
+    Net worth = sum(depository + investment balances) - sum(credit + loan balances)
+
+    For each day in the week, uses the most recent snapshot at-or-before that day
+    for each account. Days without any snapshot data are omitted from by_day.
+
+    Returns:
+        {
+            "current_net_worth": float | None,
+            "week_start_net_worth": float | None,
+            "by_day": {date_str: float},
+            "breakdown": {"depository": float, "investment": float,
+                          "credit": float, "loan": float}
+        }
+    None values indicate insufficient snapshot data.
+    """
+    from datetime import date, timedelta
+
+    NEGATIVE_TYPES = {"credit", "loan"}
+
+    def _net_worth_at(as_of: str) -> float | None:
+        with _conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.account_id, s.balance, s.type
+                FROM balance_snapshots s
+                INNER JOIN (
+                    SELECT account_id, MAX(snapped_at) AS latest
+                    FROM balance_snapshots
+                    WHERE DATE(snapped_at) <= DATE(?)
+                    GROUP BY account_id
+                ) latest_snap ON s.account_id = latest_snap.account_id
+                                AND s.snapped_at = latest_snap.latest
+                """,
+                (as_of,),
+            ).fetchall()
+        if not rows:
+            return None
+        total = 0.0
+        for r in rows:
+            bal = r["balance"]
+            total += -bal if r["type"] in NEGATIVE_TYPES else bal
+        return round(total, 2)
+
+    start = date.fromisoformat(week_start)
+    end = date.fromisoformat(week_end)
+
+    by_day: dict[str, float] = {}
+    cur = start
+    while cur <= end:
+        nw = _net_worth_at(cur.isoformat())
+        if nw is not None:
+            by_day[cur.isoformat()] = nw
+        cur += timedelta(days=1)
+
+    current_net_worth = _net_worth_at(week_end)
+    week_start_net_worth = _net_worth_at((start - timedelta(days=1)).isoformat())
+
+    # Breakdown by type using the most recent snapshot (week_end)
+    breakdown = {"depository": 0.0, "investment": 0.0, "credit": 0.0, "loan": 0.0}
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.balance, s.type
+            FROM balance_snapshots s
+            INNER JOIN (
+                SELECT account_id, MAX(snapped_at) AS latest
+                FROM balance_snapshots
+                WHERE DATE(snapped_at) <= DATE(?)
+                GROUP BY account_id
+            ) latest_snap ON s.account_id = latest_snap.account_id
+                            AND s.snapped_at = latest_snap.latest
+            """,
+            (week_end,),
+        ).fetchall()
+    for r in rows:
+        t = r["type"]
+        if t in breakdown:
+            breakdown[t] = round(breakdown[t] + r["balance"], 2)
+
+    return {
+        "current_net_worth": current_net_worth,
+        "week_start_net_worth": week_start_net_worth,
+        "by_day": by_day,
+        "breakdown": breakdown,
+    }

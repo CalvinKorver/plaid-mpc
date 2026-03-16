@@ -65,7 +65,7 @@ HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Plaid Ledger</title>
+  <title>Finances</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -119,12 +119,13 @@ HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>Plaid Ledger</h1>
+  <h1>Finances</h1>
 
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
     <div style="font-size:0.85rem;color:#555">
       <a href="/" style="margin-right:12px;color:#0070f3;text-decoration:none">Transactions</a>
-      <a href="/rules" style="color:#0070f3;text-decoration:none">Rules</a>
+      <a href="/rules" style="margin-right:12px;color:#0070f3;text-decoration:none">Rules</a>
+      <a href="/recap" style="color:#0070f3;text-decoration:none">Weekly Recap</a>
     </div>
     <button id="sync-btn" onclick="runSync()"
       style="padding:6px 14px;background:#0070f3;color:#fff;border:none;border-radius:6px;
@@ -261,13 +262,15 @@ HTML = """<!DOCTYPE html>
       // Render category list in management panel
       const listEl = document.getElementById('cat-list');
       const toplevel = data.filter(c => !c.parent);
+      const deleteBtn = (name) =>
+        `<button onclick="removeCategory('${esc(name)}')" style="margin-left:6px;padding:1px 6px;font-size:0.75rem;color:#c00;background:none;border:1px solid #c00;border-radius:4px;cursor:pointer">Delete</button>`;
       listEl.innerHTML = toplevel.map(c => {
         const children = data.filter(ch => ch.parent === c.name);
         const childHtml = children.map(ch =>
-          `<div class="child">\u2514 ${esc(ch.name)} <button onclick="removeCategory('${esc(ch.name)}')" style="margin-left:6px;padding:1px 6px;font-size:0.75rem;color:#c00;background:none;border:1px solid #c00;border-radius:4px;cursor:pointer">Remove</button></div>`
+          `<div class="child">\u2514 ${esc(ch.name)} ${deleteBtn(ch.name)}</div>`
         ).join('');
         return `<div style="margin-bottom:.5rem">
-          <div class="parent">${esc(c.name)}</div>
+          <div class="parent">${esc(c.name)} ${deleteBtn(c.name)}</div>
           ${childHtml}
         </div>`;
       }).join('');
@@ -292,7 +295,7 @@ HTML = """<!DOCTYPE html>
     }
 
     async function removeCategory(name) {
-      if (!confirm(`Remove sub-category "${name}"? Transactions using it will become uncategorized.`)) return;
+      if (!confirm(`Delete category "${name}"? Historical transactions will be preserved but the category will no longer be assignable.`)) return;
       const res = await fetch('/api/categories/' + encodeURIComponent(name), {method: 'DELETE'});
       const data = await res.json();
       if (data.ok) {
@@ -847,7 +850,7 @@ def rules_page():
     <html lang="en">
     <head>
       <meta charset="UTF-8">
-      <title>Plaid Ledger – Rules</title>
+      <title>Finances – Rules</title>
       <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#f5f5f5; color:#222; padding:24px; }}
         h1 {{ font-size:1.3rem; margin-bottom:16px; }}
@@ -894,6 +897,208 @@ def rules_page():
     </html>
     """
     return html
+
+
+@app.route("/api/weekly-recap")
+def api_weekly_recap():
+    from datetime import date, timedelta
+    week = request.args.get("week", "").strip()
+    if not week:
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+        week = monday.isoformat()
+    try:
+        import recap
+        data = recap.build_weekly_recap(week)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/recap")
+def recap_page():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Finances – Weekly Recap</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: #f5f5f5; color: #222; padding: 24px; }
+    h1 { font-size: 1.4rem; margin-bottom: 8px; }
+    .nav { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+    .nav a { color:#0070f3; text-decoration:none; font-size:0.85rem; margin-right:12px; }
+    .week-nav { display:flex; align-items:center; gap:12px; margin-bottom:20px; }
+    .week-nav button { padding:6px 14px; background:#fff; border:1px solid #ccc;
+                       border-radius:6px; cursor:pointer; font-size:0.85rem; }
+    .week-nav button:hover { background:#f0f0f0; }
+    .week-label { font-size:0.9rem; color:#555; min-width:160px; text-align:center; }
+    .card { background:#fff; border-radius:12px; box-shadow:0 1px 4px rgba(0,0,0,.1);
+            padding:24px; margin-bottom:16px; }
+    .card-label { font-size:0.7rem; font-weight:700; color:#888; letter-spacing:.06em;
+                  text-transform:uppercase; margin-bottom:4px; }
+    .card-title { font-size:1.5rem; font-weight:700; margin-bottom:4px; }
+    .card-sub { font-size:0.85rem; color:#555; margin-bottom:16px; }
+    .change-up { color:#e53935; }
+    .change-down { color:#43a047; }
+    .narrative { font-size:0.95rem; line-height:1.55; color:#333; margin-bottom:20px;
+                 padding:16px; background:#f0f4ff; border-radius:8px; border-left:3px solid #0070f3; }
+    .day-bars { display:flex; gap:6px; align-items:flex-end; height:60px; margin-bottom:16px; }
+    .day-bar-wrap { display:flex; flex-direction:column; align-items:center; flex:1; }
+    .day-bar { width:100%; background:#0070f3; border-radius:3px 3px 0 0; min-height:2px; }
+    .day-bar-label { font-size:0.65rem; color:#888; margin-top:4px; }
+    .cat-list { display:flex; flex-direction:column; gap:10px; }
+    .cat-row { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+    .cat-name { font-size:0.9rem; font-weight:600; }
+    .cat-merchants { font-size:0.75rem; color:#888; }
+    .cat-amount { font-size:0.9rem; font-weight:600; white-space:nowrap; }
+    .nw-number { font-size:2rem; font-weight:700; }
+    .nw-change { font-size:0.95rem; margin-left:8px; }
+    .breakdown { display:flex; gap:16px; flex-wrap:wrap; margin-top:12px; }
+    .breakdown-item { font-size:0.8rem; }
+    .breakdown-item span { font-weight:700; }
+    .loading { color:#888; font-size:0.9rem; }
+    .error { color:#e53935; font-size:0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <div>
+      <a href="/">Transactions</a>
+      <a href="/rules">Rules</a>
+      <a href="/recap">Weekly Recap</a>
+    </div>
+  </div>
+  <h1>Weekly Recap</h1>
+
+  <div class="week-nav">
+    <button onclick="changeWeek(-7)">&larr; Prev</button>
+    <div class="week-label" id="week-label"></div>
+    <button onclick="changeWeek(7)">Next &rarr;</button>
+  </div>
+
+  <div id="recap-container"><p class="loading">Loading...</p></div>
+
+  <script>
+    function getMondayISO(d) {
+      const day = d.getDay();
+      const diff = (day === 0 ? -6 : 1 - day);
+      const mon = new Date(d);
+      mon.setDate(d.getDate() + diff);
+      return mon.toISOString().slice(0, 10);
+    }
+
+    let currentWeek = getMondayISO(new Date());
+
+    function changeWeek(delta) {
+      const d = new Date(currentWeek + 'T00:00:00');
+      d.setDate(d.getDate() + delta);
+      currentWeek = d.toISOString().slice(0, 10);
+      loadRecap();
+    }
+
+    function fmt(n) {
+      if (n == null) return 'N/A';
+      return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+    }
+    function fmtSigned(n) {
+      if (n == null) return 'N/A';
+      const sign = n >= 0 ? '+' : '-';
+      return sign + '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+    }
+    function shortDate(iso) {
+      const d = new Date(iso + 'T00:00:00');
+      return ['Su','Mo','Tu','We','Th','Fr','Sa'][d.getDay()];
+    }
+
+    async function loadRecap() {
+      document.getElementById('week-label').textContent = 'Loading...';
+      document.getElementById('recap-container').innerHTML = '<p class="loading">Loading...</p>';
+      try {
+        const res = await fetch('/api/weekly-recap?week=' + currentWeek);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        render(data);
+      } catch(e) {
+        document.getElementById('recap-container').innerHTML =
+          '<p class="error">Error: ' + e.message + '</p>';
+        document.getElementById('week-label').textContent = currentWeek;
+      }
+    }
+
+    function render(data) {
+      const s = data.spending;
+      const nw = data.net_worth;
+      document.getElementById('week-label').textContent =
+        data.week_start + ' – ' + data.week_end;
+
+      // Day bars
+      const dayEntries = Object.entries(s.by_day).sort();
+      const maxAmt = Math.max(...dayEntries.map(e => e[1]), 1);
+      const barsHtml = dayEntries.map(([d, amt]) => {
+        const pct = Math.round((amt / maxAmt) * 100);
+        return '<div class="day-bar-wrap">' +
+          '<div class="day-bar" style="height:' + Math.max(pct, 2) + '%"></div>' +
+          '<div class="day-bar-label">' + shortDate(d) + '</div>' +
+          '</div>';
+      }).join('');
+
+      // Categories
+      const catHtml = (s.by_category || []).slice(0, 5).map(c => {
+        const merchants = (c.transactions || []).slice(0,3).map(t => t.name).filter(Boolean).join(', ');
+        return '<div class="cat-row">' +
+          '<div><div class="cat-name">' + c.category + '</div>' +
+          '<div class="cat-merchants">' + (merchants || '') + '</div></div>' +
+          '<div class="cat-amount">' + fmt(c.total) + '</div>' +
+          '</div>';
+      }).join('');
+
+      // Net worth
+      const nwChangeClass = nw.change_amount == null ? '' :
+        (nw.change_amount >= 0 ? 'change-up' : 'change-down');
+      const nwChangePct = nw.change_pct != null ?
+        ' (' + (nw.change_pct >= 0 ? '+' : '') + nw.change_pct.toFixed(2) + '%)' : '';
+
+      // Breakdown
+      const bd = nw.breakdown || {};
+      const breakdownHtml = Object.entries(bd).filter(([,v]) => v !== 0).map(([k,v]) =>
+        '<div class="breakdown-item">' + k + ': <span>' + fmt(v) + '</span></div>'
+      ).join('');
+
+      const changeClass = s.direction === 'up' ? 'change-up' : (s.direction === 'down' ? 'change-down' : '');
+
+      document.getElementById('recap-container').innerHTML =
+        (data.narrative ? '<div class="narrative">' + data.narrative + '</div>' : '') +
+
+        '<div class="card">' +
+          '<div class="card-label">Spending</div>' +
+          '<div class="card-title">' + fmt(s.total) + '</div>' +
+          '<div class="card-sub ' + changeClass + '">' + s.description + ' vs last week</div>' +
+          '<div class="day-bars">' + barsHtml + '</div>' +
+          '<div class="cat-list">' + (catHtml || '<p style="color:#888;font-size:0.85rem">No transactions this week.</p>') + '</div>' +
+          (s.income_total > 0 ? '<div style="margin-top:12px;font-size:0.8rem;color:#888">Deposits/income: ' + fmt(s.income_total) + '</div>' : '') +
+        '</div>' +
+
+        '<div class="card">' +
+          '<div class="card-label">Net Worth</div>' +
+          (nw.current != null ?
+            '<div style="display:flex;align-items:baseline">' +
+              '<div class="nw-number">' + fmt(nw.current) + '</div>' +
+              (nw.change_amount != null ?
+                '<div class="nw-change ' + nwChangeClass + '">' + fmtSigned(nw.change_amount) + nwChangePct + '</div>'
+                : '') +
+            '</div>'
+            : '<div style="color:#888;font-size:0.9rem">No balance snapshot data yet. Trigger a sync to start tracking net worth.</div>') +
+          (breakdownHtml ? '<div class="breakdown">' + breakdownHtml + '</div>' : '') +
+        '</div>';
+    }
+
+    loadRecap();
+  </script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":

@@ -174,27 +174,63 @@ class TestDb(unittest.TestCase):
         names = {c["name"] for c in db_module.get_all_categories()}
         self.assertNotIn("Groceries", names)
 
-    def test_remove_subcategory_clears_transactions(self):
+    def test_remove_subcategory_preserves_transactions(self):
         db_module.upsert_transactions([self._tx("tx_groc", "FOOD_AND_DRINK")])
         db_module.set_custom_category("tx_groc", "Groceries")
         db_module.remove_category("Groceries")
         rows = db_module.query_transactions("2026-03-01", "2026-03-01")
-        self.assertIsNone(rows[0]["custom_category"])
+        self.assertEqual(rows[0]["custom_category"], "Groceries")
 
     def test_remove_nonexistent_category_raises(self):
         with self.assertRaises(ValueError):
             db_module.remove_category("DoesNotExist")
 
-    def test_remove_top_level_category_raises(self):
-        with self.assertRaises(ValueError):
-            db_module.remove_category("Food & Dining")
+    def test_remove_top_level_category(self):
+        ok = db_module.remove_category("Food & Dining")
+        self.assertTrue(ok)
+        names = {c["name"] for c in db_module.get_all_categories()}
+        self.assertNotIn("Food & Dining", names)
 
-    def test_remove_subcategory_then_readd_as_top_level(self):
+    def test_remove_top_level_cascades_to_children(self):
+        db_module.remove_category("Food & Dining")
+        names = {c["name"] for c in db_module.get_all_categories()}
+        self.assertNotIn("Groceries", names)
+
+    def test_remove_already_deleted_raises(self):
+        db_module.remove_category("Groceries")
+        with self.assertRaises(ValueError):
+            db_module.remove_category("Groceries")
+
+    def test_remove_subcategory_then_readd(self):
+        db_module.remove_category("Groceries")
+        ok = db_module.add_category("Groceries", "Food & Dining")
+        self.assertTrue(ok)
+        cats = {c["name"]: c["parent"] for c in db_module.get_all_categories()}
+        self.assertEqual(cats["Groceries"], "Food & Dining")
+
+    def test_remove_subcategory_readd_as_top_level(self):
         db_module.remove_category("Groceries")
         ok = db_module.add_category("Groceries")
         self.assertTrue(ok)
         cats = {c["name"]: c["parent"] for c in db_module.get_all_categories()}
         self.assertEqual(cats["Groceries"], "")
+
+    def test_remove_top_level_removes_budget(self):
+        db_module.set_budget("Entertainment", 50.0)
+        db_module.remove_category("Entertainment")
+        budgets = {b["category"] for b in db_module.get_all_budgets()}
+        self.assertNotIn("Entertainment", budgets)
+
+    def test_remove_top_level_removes_children_budgets(self):
+        db_module.set_budget("Groceries", 200.0)
+        db_module.remove_category("Food & Dining")
+        budgets = {b["category"] for b in db_module.get_all_budgets()}
+        self.assertNotIn("Groceries", budgets)
+
+    def test_add_with_soft_deleted_parent_raises(self):
+        db_module.remove_category("Food & Dining")
+        with self.assertRaises(ValueError):
+            db_module.add_category("Restaurants", parent="Food & Dining")
 
     # --- set_category_mapping ---
 

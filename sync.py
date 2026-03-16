@@ -150,7 +150,7 @@ def sync_and_store() -> dict:
         }
 
     client, _ = _ensure_client()
-    totals = {"added": 0, "modified": 0, "removed": 0}
+    totals = {"added": 0, "modified": 0, "removed": 0, "snapshots_taken": 0}
     all_added_ids: list[str] = []
 
     for token_hash, token in _get_all_tokens():
@@ -172,6 +172,19 @@ def sync_and_store() -> dict:
             }
             for a in acct_resp["accounts"]
         ])
+
+        # Snapshot balances from the already-fetched acct_resp (zero extra API calls)
+        for a in acct_resp["accounts"]:
+            balances = a["balances"]
+            db.upsert_balance_snapshot(
+                account_id=a["account_id"],
+                balance=balances["current"] or 0.0,
+                available=balances.get("available"),
+                currency=balances.get("iso_currency_code") or "USD",
+                account_type=str(a["type"]),
+                account_subtype=str(a["subtype"]),
+            )
+            totals["snapshots_taken"] += 1
 
         # 2. Sync transactions
         cursor = db.get_cursor(token_hash)

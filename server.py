@@ -490,5 +490,27 @@ def add_category(name: str, parent: str = "") -> dict:
         return {"ok": False, "error": str(e), "name": name, "parent": parent}
 
 
+@mcp.tool()
+def get_weekly_recap(week_start_date: str) -> dict:
+    """
+    Generate a weekly financial recap for the week starting on week_start_date.
+
+    Args:
+        week_start_date: YYYY-MM-DD — the first day of the target week.
+
+    Returns a dict with keys: week_start, week_end, spending, net_worth, narrative.
+
+    spending includes: total, prior_week_total, change_amount, change_pct, direction,
+    description, by_day (per-day amounts), by_category (with top merchants), income_total.
+
+    net_worth includes: current, prior_week, change_amount, change_pct, by_day, breakdown.
+    Requires prior syncs to have run so that balance_snapshots data exists.
+
+    narrative is a Claude-generated 2-3 sentence human-readable summary.
+    """
+    import recap
+    return recap.build_weekly_recap(week_start_date)
+
+
 if __name__ == "__main__":
     mcp.run()

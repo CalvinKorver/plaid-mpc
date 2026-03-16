@@ -65,6 +65,11 @@ def _make_mock_plaid_client(added_txns: list) -> MagicMock:
             "type": _StrDate("depository"),
             "subtype": _StrDate("checking"),
             "mask": "1234",
+            "balances": {
+                "current": 1000.0,
+                "available": 900.0,
+                "iso_currency_code": "USD",
+            },
         }]
     }[key]
     mock.accounts_balance_get.return_value = acct_resp
