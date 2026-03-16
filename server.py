@@ -338,6 +338,9 @@ def sync_and_store() -> dict:
     # obvious defaults, then run manual rules which can further specialize.
     totals["auto_categorized"] = db.apply_auto_categorization()
     totals["rules_applied"] = db.apply_rules_to_new_transactions()
+    # Finally, use Claude to validate/assign categories for anything still uncategorized
+    import classifier
+    totals["claude_categorized"] = classifier.apply_claude_categorization_from_db()
     return totals
 
 

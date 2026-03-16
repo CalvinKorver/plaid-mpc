@@ -7,11 +7,58 @@ Usage:
     # Open http://localhost:5050
 """
 
+import logging
+import threading
+from datetime import datetime
+
 from flask import Flask, jsonify, request
+
 import db
 
 db.init_db()
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Background sync scheduler
+# ---------------------------------------------------------------------------
+
+_sync_available = False
+_plaid_sync = None
+
+try:
+    from sync import sync_and_store as _plaid_sync_fn
+    _plaid_sync = _plaid_sync_fn
+    _sync_available = True
+except Exception as _sync_import_err:
+    logging.getLogger(__name__).warning(
+        "[sync] sync module not available: %s", _sync_import_err
+    )
+
+_sync_lock = threading.Lock()
+
+
+def _run_sync_bg() -> None:
+    """Run full sync in background; silently skip if already running."""
+    if not _sync_available or not _sync_lock.acquire(blocking=False):
+        return
+    try:
+        result = _plaid_sync()
+        print(f"[sync] complete: {result}", flush=True)
+    except Exception as e:
+        print(f"[sync] error: {e}", flush=True)
+    finally:
+        _sync_lock.release()
+
+
+if _sync_available:
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        _scheduler = BackgroundScheduler(daemon=True)
+        # Run immediately on startup, then every 12 hours
+        _scheduler.add_job(_run_sync_bg, "interval", hours=12, next_run_time=datetime.now())
+        _scheduler.start()
+    except Exception as _sched_err:
+        logging.getLogger(__name__).warning("[sync] scheduler failed to start: %s", _sched_err)
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -79,7 +126,9 @@ HTML = """<!DOCTYPE html>
       <a href="/" style="margin-right:12px;color:#0070f3;text-decoration:none">Transactions</a>
       <a href="/rules" style="color:#0070f3;text-decoration:none">Rules</a>
     </div>
-    <div style="font-size:0.8rem;color:#777">Plaid Ledger</div>
+    <button id="sync-btn" onclick="runSync()"
+      style="padding:6px 14px;background:#0070f3;color:#fff;border:none;border-radius:6px;
+             font-size:0.8rem;cursor:pointer;white-space:nowrap">Sync</button>
   </div>
 
   <div class="controls">
@@ -598,6 +647,26 @@ HTML = """<!DOCTYPE html>
       await loadBudgetStatus();
     }
 
+    async function runSync() {
+      const btn = document.getElementById('sync-btn');
+      btn.disabled = true;
+      btn.textContent = 'Syncing\u2026';
+      try {
+        const res = await fetch('/api/sync', {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+          btn.textContent = `+${data.added ?? 0} synced`;
+          await Promise.all([loadAccounts(), load()]);
+        } else {
+          btn.textContent = (data.error || '').includes('progress') ? 'Busy\u2026' : 'Failed';
+        }
+      } catch {
+        btn.textContent = 'Error';
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = 'Sync'; }, 3000);
+      }
+    }
+
     (async () => {
       // Set budget month default to current month
       const now = new Date();
@@ -738,6 +807,22 @@ def api_create_rule():
 def api_delete_rule(rule_id: int):
     db.delete_rule(rule_id)
     return jsonify({"ok": True})
+
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    """Trigger an incremental Plaid sync synchronously. Returns sync result counts."""
+    if not _sync_available:
+        return jsonify({"ok": False, "error": "Sync not configured — check Plaid env vars"}), 503
+    if not _sync_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Sync already in progress"}), 409
+    try:
+        result = _plaid_sync()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        _sync_lock.release()
 
 
 @app.route("/rules")

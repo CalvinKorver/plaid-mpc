@@ -100,6 +100,17 @@ def init_db() -> None:
                 old_category TEXT,
                 created_at   TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS categorization_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT NOT NULL,
+                logged_at      TEXT NOT NULL,
+                source         TEXT NOT NULL,
+                old_category   TEXT,
+                new_category   TEXT NOT NULL,
+                reason         TEXT,
+                model          TEXT
+            );
         """)
 
         # For existing installations created before old_payee/old_category were added,
@@ -371,6 +382,44 @@ def get_uncategorized(limit: int = 50) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_custom_categories_for_ids(transaction_ids: list[str]) -> dict[str, str | None]:
+    """
+    Return {transaction_id: custom_category} for the given IDs.
+    custom_category is None if the column is NULL.
+    Used to detect which transactions were changed by rules.
+    """
+    if not transaction_ids:
+        return {}
+    placeholders = ",".join("?" * len(transaction_ids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT transaction_id, custom_category FROM transactions WHERE transaction_id IN ({placeholders})",
+            transaction_ids,
+        ).fetchall()
+    return {r["transaction_id"]: r["custom_category"] for r in rows}
+
+
+def insert_categorization_log(
+    transaction_id: str,
+    source: str,
+    old_category: str | None,
+    new_category: str,
+    reason: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Insert one row into categorization_log for audit purposes."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO categorization_log
+                (transaction_id, logged_at, source, old_category, new_category, reason, model)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (transaction_id, now, source, old_category, new_category, reason, model),
+        )
 
 
 def upsert_item(token_hash: str, token_enc: str, institution: str = "") -> None:
