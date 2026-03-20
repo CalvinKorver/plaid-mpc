@@ -29,8 +29,8 @@ def _build_prompt(candidates: list[dict], categories: list[str]) -> str:
         [
             {
                 "id": c["transaction_id"],
-                "name": c["name"],
-                "merchant_name": c["merchant_name"],
+                "name": c.get("custom_name") or c["name"],
+                "merchant_name": c.get("custom_merchant_name") or c["merchant_name"],
                 "amount": c["amount"],
                 "assigned_category": c["current_category"],
             }
@@ -162,6 +162,8 @@ def apply_claude_categorization_from_db() -> int:
             "transaction_id": t["transaction_id"],
             "name": t["name"] or "",
             "merchant_name": t["merchant_name"] or "",
+            "custom_name": t.get("custom_name"),
+            "custom_merchant_name": t.get("custom_merchant_name"),
             "amount": t["amount"],
             "current_category": t.get("custom_category"),
         }

@@ -116,6 +116,11 @@ HTML = """<!DOCTYPE html>
     .cat-add input[type=text] { padding: 7px 10px; border: 1px solid #ccc;
                                  border-radius: 6px; font-size: 0.9rem; }
     .cat-add button { align-self: auto; }
+    .name-edit { font-size: 0.875rem; padding: 1px 4px; border: 1px solid #aaa;
+                 border-radius: 4px; width: 100%; min-width: 120px; box-sizing: border-box; }
+    .name-editable { cursor: pointer; }
+    .name-editable:hover { text-decoration: underline dotted #aaa; }
+    .name-editable.custom { color: #166534; }
   </style>
 </head>
 <body>
@@ -193,6 +198,46 @@ HTML = """<!DOCTYPE html>
         <input type="number" id="budget-amount" placeholder="Monthly budget $" min="0" step="0.01"
                style="width:150px;padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem">
         <button onclick="setBudget()">Set Budget</button>
+      </div>
+    </div>
+  </details>
+
+  <details>
+    <summary>Manual Accounts</summary>
+    <div class="cat-panel">
+      <div id="manual-accts-list" style="margin-bottom:14px"></div>
+      <div style="font-weight:600;font-size:0.85rem;margin-bottom:10px">Add Account</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="ma-name" placeholder="e.g. Workday 401(k)"
+                 style="padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem;width:180px">
+        </div>
+        <div class="field">
+          <label>Institution</label>
+          <input type="text" id="ma-institution" placeholder="Fidelity"
+                 style="padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem;width:130px">
+        </div>
+        <div class="field">
+          <label>Type</label>
+          <select id="ma-type" style="padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem">
+            <option value="investment">Investment</option>
+            <option value="depository">Depository</option>
+            <option value="credit">Credit</option>
+            <option value="loan">Loan</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Subtype</label>
+          <input type="text" id="ma-subtype" placeholder="401k / ira / hsa"
+                 style="padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem;width:120px">
+        </div>
+        <div class="field">
+          <label>Balance ($)</label>
+          <input type="number" id="ma-balance" placeholder="0.00" min="0" step="0.01"
+                 style="padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.9rem;width:120px">
+        </div>
+        <button onclick="addManualAccount()">Add</button>
       </div>
     </div>
   </details>
@@ -371,11 +416,15 @@ HTML = """<!DOCTYPE html>
         const amtClass = 'amount ' + (isCredit ? 'credit' : 'debit');
         const cat = r.custom_category || r.plaid_category || '';
         const badgeClass = 'cat-badge' + (r.custom_category ? ' custom' : '');
-        const merchant = r.merchant_name && r.merchant_name !== r.name
-          ? `<br><span style="color:#888;font-size:0.78rem">${esc(r.merchant_name)}</span>` : '';
+        const txId = esc(r.transaction_id);
+        const dispName = r.custom_name || r.name;
+        const dispMerchant = r.custom_merchant_name || r.merchant_name;
+        const merchant = dispMerchant && dispMerchant !== dispName
+          ? `<br><small class="name-editable" onclick="startEditName(this,'${txId}','merchant_name')"
+               style="color:#888;font-size:0.78rem">${esc(dispMerchant)}</small>` : '';
         return `<tr>
           <td>${r.date}</td>
-          <td>${esc(r.name)}${merchant}</td>
+          <td><span class="name-editable${r.custom_name ? ' custom' : ''}" onclick="startEditName(this,'${txId}','name')">${esc(dispName)}</span>${merchant}</td>
           <td class="${amtClass}">${display}</td>
           <td>${esc(r.account_name || 'Unknown')}</td>
           <td><span class="${badgeClass}" onclick="startEdit(this,'${esc(r.transaction_id)}')">${esc(cat)}</span></td>
@@ -416,6 +465,39 @@ HTML = """<!DOCTYPE html>
       sel.onblur = () => render();
       badge.replaceWith(sel);
       sel.focus();
+    }
+
+    function startEditName(el, txId, field) {
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.className = 'name-edit';
+      inp.value = el.textContent.trim();
+
+      const commit = async () => {
+        inp.onblur = null;
+        const newVal = inp.value.trim();
+        if (newVal === el.textContent.trim()) { render(); return; }
+        const payload = { transaction_id: txId };
+        payload[field] = newVal;
+        await fetch('/api/transaction_name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const row = rows.find(r => r.transaction_id === txId);
+        if (row) row[field === 'name' ? 'custom_name' : 'custom_merchant_name'] = newVal;
+        render();
+      };
+
+      inp.onblur = commit;
+      inp.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+        if (e.key === 'Escape') { inp.onblur = null; render(); }
+      };
+
+      el.replaceWith(inp);
+      inp.focus();
+      inp.select();
     }
 
     function openRuleModal(txId) {
@@ -670,13 +752,115 @@ HTML = """<!DOCTYPE html>
       }
     }
 
+    async function loadManualAccounts() {
+      const res = await fetch('/api/manual-accounts');
+      const data = await res.json();
+      const el = document.getElementById('manual-accts-list');
+      if (!data.length) {
+        el.innerHTML = '<div style="font-size:0.85rem;color:#888;margin-bottom:8px">No manual accounts yet.</div>';
+        return;
+      }
+      el.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;margin-bottom:8px">
+          <thead style="background:#f0f0f0">
+            <tr>
+              <th style="text-align:left;padding:8px 10px;font-size:0.8rem">Name</th>
+              <th style="text-align:left;padding:8px 10px;font-size:0.8rem">Institution</th>
+              <th style="text-align:left;padding:8px 10px;font-size:0.8rem">Type / Subtype</th>
+              <th style="text-align:right;padding:8px 10px;font-size:0.8rem">Balance</th>
+              <th style="text-align:left;padding:8px 10px;font-size:0.8rem">Last Updated</th>
+              <th style="padding:8px 10px;font-size:0.8rem"></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.map(a => {
+              const bal = a.balance != null ? '$' + Number(a.balance).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}) : 'N/A';
+              const updated = a.snapped_at ? a.snapped_at.slice(0,10) : '—';
+              const aid = esc(a.account_id);
+              return `<tr>
+                <td style="padding:8px 10px;border-top:1px solid #eee;font-size:0.875rem">${esc(a.name)}</td>
+                <td style="padding:8px 10px;border-top:1px solid #eee;font-size:0.875rem">${esc(a.institution||'')}</td>
+                <td style="padding:8px 10px;border-top:1px solid #eee;font-size:0.875rem">${esc(a.type||'')}${a.subtype ? ' / '+esc(a.subtype) : ''}</td>
+                <td style="padding:8px 10px;border-top:1px solid #eee;font-size:0.875rem;text-align:right;font-variant-numeric:tabular-nums" id="ma-bal-${aid}">${bal}</td>
+                <td style="padding:8px 10px;border-top:1px solid #eee;font-size:0.875rem;color:#888">${updated}</td>
+                <td style="padding:8px 10px;border-top:1px solid #eee;white-space:nowrap">
+                  <span id="ma-upd-${aid}">
+                    <button onclick="startUpdateBalance('${aid}')"
+                            style="padding:2px 8px;font-size:0.75rem;border-radius:4px;border:1px solid #0070f3;background:#fff;color:#0070f3;cursor:pointer">Update</button>
+                  </span>
+                  <button onclick="deleteManualAccount('${aid}')"
+                          style="margin-left:4px;padding:2px 8px;font-size:0.75rem;border-radius:4px;border:1px solid #c00;background:#fff;color:#c00;cursor:pointer">Delete</button>
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function startUpdateBalance(accountId) {
+      const cell = document.getElementById('ma-upd-' + accountId);
+      cell.innerHTML = `
+        <input type="number" id="ma-new-bal-${accountId}" min="0" step="0.01" placeholder="New balance"
+               style="width:110px;padding:3px 6px;border:1px solid #ccc;border-radius:4px;font-size:0.8rem">
+        <button onclick="commitUpdateBalance('${accountId}')"
+                style="padding:2px 8px;font-size:0.75rem;border-radius:4px;border:none;background:#0070f3;color:#fff;cursor:pointer">Save</button>
+        <button onclick="loadManualAccounts()"
+                style="padding:2px 6px;font-size:0.75rem;border-radius:4px;border:1px solid #ccc;background:#fff;cursor:pointer">✕</button>
+      `;
+      document.getElementById('ma-new-bal-' + accountId).focus();
+    }
+
+    async function commitUpdateBalance(accountId) {
+      const inp = document.getElementById('ma-new-bal-' + accountId);
+      const balance = parseFloat(inp.value);
+      if (isNaN(balance)) { alert('Enter a valid balance.'); return; }
+      const res = await fetch('/api/manual-accounts/' + accountId, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({balance})
+      });
+      const data = await res.json();
+      if (!data.ok) { alert(data.error || 'Failed to update balance'); return; }
+      await loadManualAccounts();
+    }
+
+    async function addManualAccount() {
+      const name = document.getElementById('ma-name').value.trim();
+      const institution = document.getElementById('ma-institution').value.trim();
+      const type = document.getElementById('ma-type').value;
+      const subtype = document.getElementById('ma-subtype').value.trim();
+      const balance = parseFloat(document.getElementById('ma-balance').value);
+      if (!name) { alert('Name is required.'); return; }
+      if (isNaN(balance)) { alert('Enter a valid balance.'); return; }
+      const res = await fetch('/api/manual-accounts', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, institution, type, subtype, balance})
+      });
+      const data = await res.json();
+      if (!data.ok) { alert(data.error || 'Failed to add account'); return; }
+      document.getElementById('ma-name').value = '';
+      document.getElementById('ma-subtype').value = '';
+      document.getElementById('ma-balance').value = '';
+      await loadManualAccounts();
+    }
+
+    async function deleteManualAccount(accountId) {
+      if (!confirm('Delete this manual account and all its balance history?')) return;
+      const res = await fetch('/api/manual-accounts/' + accountId, {method: 'DELETE'});
+      const data = await res.json();
+      if (!data.ok) { alert(data.error || 'Failed to delete'); return; }
+      await loadManualAccounts();
+    }
+
     (async () => {
       // Set budget month default to current month
       const now = new Date();
       document.getElementById('budget-month').value =
         `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
-      await Promise.all([loadCategories(), loadAccounts()]);
+      await Promise.all([loadCategories(), loadAccounts(), loadManualAccounts()]);
       loadBudgetStatus();
       load();
     })();
@@ -706,6 +890,51 @@ def api_transactions():
 @app.route("/api/accounts")
 def api_accounts():
     return jsonify(db.get_all_accounts())
+
+
+@app.route("/api/manual-accounts")
+def api_get_manual_accounts():
+    return jsonify(db.get_manual_accounts())
+
+
+@app.route("/api/manual-accounts", methods=["POST"])
+def api_create_manual_account():
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    account_type = (data.get("type") or "").strip()
+    subtype = (data.get("subtype") or "").strip()
+    institution = (data.get("institution") or "").strip()
+    balance = data.get("balance")
+    if not name or not account_type:
+        return jsonify({"ok": False, "error": "name and type are required"}), 400
+    try:
+        balance = float(balance)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "balance must be a number"}), 400
+    account_id = db.create_manual_account(name, account_type, subtype, balance, institution)
+    return jsonify({"ok": True, "account_id": account_id})
+
+
+@app.route("/api/manual-accounts/<account_id>", methods=["PUT"])
+def api_update_manual_account(account_id: str):
+    data = request.get_json(force=True)
+    balance = data.get("balance")
+    try:
+        balance = float(balance)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "balance must be a number"}), 400
+    ok = db.update_manual_account_balance(account_id, balance)
+    if not ok:
+        return jsonify({"ok": False, "error": "Account not found or not manual"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/manual-accounts/<account_id>", methods=["DELETE"])
+def api_delete_manual_account(account_id: str):
+    ok = db.delete_manual_account(account_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "Account not found or not manual"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/api/budgets")
@@ -742,6 +971,20 @@ def api_category():
     tx_id = data.get("transaction_id", "")
     category = data.get("category", "")
     ok = db.set_custom_category(tx_id, category)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/transaction_name", methods=["POST"])
+def api_transaction_name():
+    data = request.get_json(force=True)
+    tx_id = data.get("transaction_id", "")
+    name = data.get("name")
+    merchant_name = data.get("merchant_name")
+    if not tx_id:
+        return jsonify({"ok": False, "error": "transaction_id required"}), 400
+    if name is None and merchant_name is None:
+        return jsonify({"ok": False, "error": "name or merchant_name required"}), 400
+    ok = db.set_transaction_name(tx_id, name, merchant_name)
     return jsonify({"ok": ok})
 
 

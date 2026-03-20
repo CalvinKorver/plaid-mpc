@@ -248,8 +248,12 @@ def sync_and_store() -> dict:
     # 6. Apply plaid_category_map to fill remaining NULL (those not matched by rules)
     totals["auto_categorized"] = db.apply_auto_categorization()
 
-    # 7. Build Claude candidate list (new transactions minus rule-matched)
-    claude_candidate_ids = [tx_id for tx_id in all_added_ids if tx_id not in rule_matched_ids]
+    # 7. Build Claude candidate list (new transactions minus rule-matched and hidden)
+    hidden_ids = db.get_hidden_transaction_ids(all_added_ids)
+    claude_candidate_ids = [
+        tx_id for tx_id in all_added_ids
+        if tx_id not in rule_matched_ids and tx_id not in hidden_ids
+    ]
 
     candidates: list[dict] = []
     if claude_candidate_ids:
@@ -264,6 +268,8 @@ def sync_and_store() -> dict:
                     "transaction_id": tx_id,
                     "name": tx.get("name") or "",
                     "merchant_name": tx.get("merchant_name") or "",
+                    "custom_name": tx.get("custom_name"),
+                    "custom_merchant_name": tx.get("custom_merchant_name"),
                     "amount": tx.get("amount", 0.0),
                     "current_category": post_autocat_snap.get(tx_id),
                 })

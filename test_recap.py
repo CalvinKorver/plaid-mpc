@@ -308,5 +308,232 @@ class TestBuildWeeklyRecap(unittest.TestCase):
         self.assertEqual(result["narrative"], "A quiet spending week.")
 
 
+class TestBuildNarrativePromptWithMarketContext(unittest.TestCase):
+    def _sample_recap(self, market_context=None):
+        base = {
+            "week_start": "2026-03-09",
+            "week_end": "2026-03-15",
+            "spending": {
+                "total": 200.0,
+                "prior_week_total": 400.0,
+                "change_amount": -200.0,
+                "change_pct": -50.0,
+                "direction": "down",
+                "description": "down 50%",
+                "by_day": {},
+                "by_category": [],
+                "income_total": 3000.0,
+            },
+            "net_worth": {
+                "current": 50000.0,
+                "prior_week": 49000.0,
+                "change_amount": 1000.0,
+                "change_pct": 2.04,
+                "by_day": {},
+                "breakdown": {},
+            },
+            "narrative": "",
+        }
+        if market_context is not None:
+            base["market_context"] = market_context
+        return base
+
+    def test_market_prompt_includes_market_data_when_present(self):
+        recap_data = self._sample_recap(market_context={
+            "snapshot": {"S&P 500": {"start": 5000.0, "end": 5075.0, "change_pct": 1.5}},
+            "finance_headlines": [{"title": "Fed holds rates", "published": "2026-03-10"}],
+            "top_headlines": [{"title": "Tech earnings beat", "published": "2026-03-12"}],
+        })
+        prompt = recap_module.build_market_narrative_prompt(recap_data)
+        self.assertIn("S&P 500", prompt)
+        self.assertIn("Fed holds rates", prompt)
+        self.assertIn("Tech earnings beat", prompt)
+
+    def test_prompt_omits_market_section_when_context_empty(self):
+        recap_data = self._sample_recap(market_context={
+            "snapshot": {},
+            "finance_headlines": [],
+            "top_headlines": [],
+        })
+        prompt = recap_module.build_narrative_prompt(recap_data)
+        self.assertNotIn("Market performance", prompt)
+        self.assertNotIn("finance headlines", prompt.lower())
+
+    def test_prompt_omits_market_section_when_key_missing(self):
+        # Backward compat — no market_context key at all
+        recap_data = self._sample_recap()
+        # Should not raise KeyError
+        prompt = recap_module.build_narrative_prompt(recap_data)
+        self.assertNotIn("Market performance", prompt)
+
+
+class TestBuildWeeklyRecapMarketContext(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        db_module.DB_PATH = Path(self.tmp.name)
+        db_module.init_db()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _patch_market(self, snapshot=None, finance_headlines=None, top_headlines=None):
+        """Return a context manager that patches all three market functions."""
+        from unittest.mock import patch as _patch
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            with _patch("recap.market.get_market_snapshot", return_value=snapshot or {}), \
+                 _patch("recap.market.get_finance_headlines", return_value=finance_headlines or []), \
+                 _patch("recap.market.get_top_news_headlines", return_value=top_headlines or []):
+                yield
+
+        return _cm()
+
+    def test_market_context_key_present_in_result(self):
+        with self._patch_market(
+            snapshot={"S&P 500": {"start": 5000.0, "end": 5050.0, "change_pct": 1.0}},
+            finance_headlines=[{"title": "Finance news", "published": "2026-03-10"}],
+            top_headlines=[{"title": "Top news", "published": "2026-03-11"}],
+        ):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+                result = recap_module.build_weekly_recap("2026-03-09")
+        ctx = result["market_context"]
+        self.assertIn("snapshot", ctx)
+        self.assertIn("finance_headlines", ctx)
+        self.assertIn("top_headlines", ctx)
+
+    def test_week_dates_passed_to_headline_functions(self):
+        with patch("recap.market.get_market_snapshot", return_value={}), \
+             patch("recap.market.get_finance_headlines", return_value=[]) as mock_fin, \
+             patch("recap.market.get_top_news_headlines", return_value=[]) as mock_top:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+                recap_module.build_weekly_recap("2026-03-09")
+        # Both wrappers must receive the week dates as first two positional args
+        fin_args = mock_fin.call_args[0]
+        top_args = mock_top.call_args[0]
+        self.assertEqual(fin_args[0], "2026-03-09")
+        self.assertEqual(fin_args[1], "2026-03-15")
+        self.assertEqual(top_args[0], "2026-03-09")
+        self.assertEqual(top_args[1], "2026-03-15")
+
+    def test_market_context_empty_on_all_failures(self):
+        with self._patch_market():
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+                result = recap_module.build_weekly_recap("2026-03-09")
+        self.assertEqual(result["market_context"]["snapshot"], {})
+        self.assertEqual(result["market_context"]["finance_headlines"], [])
+        self.assertEqual(result["market_context"]["top_headlines"], [])
+
+    def test_narrative_generated_with_market_context(self):
+        mock_client = _make_mock_narrative_client("Great week with steady markets.")
+        with self._patch_market(
+            snapshot={"S&P 500": {"start": 5000.0, "end": 5050.0, "change_pct": 1.0}},
+            finance_headlines=[{"title": "Markets up", "published": "2026-03-10"}],
+            top_headlines=[],
+        ):
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                with patch("anthropic.Anthropic", return_value=mock_client):
+                    result = recap_module.build_weekly_recap("2026-03-09")
+        self.assertEqual(result["narrative"], "Great week with steady markets.")
+
+
+class TestGenerateMarketNarrative(unittest.TestCase):
+    def _sample_recap(self):
+        return {
+            "week_start": "2026-03-09",
+            "week_end": "2026-03-15",
+            "spending": {
+                "total": 200.0, "prior_week_total": 400.0, "change_amount": -200.0,
+                "change_pct": -50.0, "direction": "down", "description": "down 50%",
+                "by_day": {}, "by_category": [], "income_total": 3000.0,
+            },
+            "net_worth": {
+                "current": 50000.0, "prior_week": 49000.0,
+                "change_amount": 1000.0, "change_pct": 2.04, "by_day": {}, "breakdown": {},
+            },
+            "market_context": {"snapshot": {}, "finance_headlines": [], "top_headlines": []},
+            "narrative": "",
+        }
+
+    def test_returns_headline_and_narrative_from_valid_json(self):
+        payload = '{"headline": "Markets fell on rate fears", "narrative": "The S&P dropped 2%."}'
+        mock_client = _make_mock_narrative_client(payload)
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("anthropic.Anthropic", return_value=mock_client):
+                result = recap_module.generate_market_narrative(self._sample_recap())
+        self.assertEqual(result["headline"], "Markets fell on rate fears")
+        self.assertEqual(result["narrative"], "The S&P dropped 2%.")
+
+    def test_strips_markdown_code_fences(self):
+        payload = '```json\n{"headline": "Markets rose on strong jobs data", "narrative": "Indexes up."}\n```'
+        mock_client = _make_mock_narrative_client(payload)
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("anthropic.Anthropic", return_value=mock_client):
+                result = recap_module.generate_market_narrative(self._sample_recap())
+        self.assertEqual(result["headline"], "Markets rose on strong jobs data")
+        self.assertEqual(result["narrative"], "Indexes up.")
+
+    def test_falls_back_gracefully_when_json_invalid(self):
+        plain_text = "Markets were volatile this week amid uncertainty."
+        mock_client = _make_mock_narrative_client(plain_text)
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("anthropic.Anthropic", return_value=mock_client):
+                result = recap_module.generate_market_narrative(self._sample_recap())
+        self.assertEqual(result["headline"], "")
+        self.assertEqual(result["narrative"], plain_text)
+
+    def test_returns_empty_when_api_key_not_set(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            result = recap_module.generate_market_narrative(self._sample_recap())
+        self.assertEqual(result, {"headline": "", "narrative": ""})
+
+    def test_returns_empty_on_api_exception(self):
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = Exception("API error")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("anthropic.Anthropic", return_value=mock_client):
+                result = recap_module.generate_market_narrative(self._sample_recap())
+        self.assertEqual(result, {"headline": "", "narrative": ""})
+
+
+class TestBuildWeeklyRecapDualNarratives(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        db_module.DB_PATH = Path(self.tmp.name)
+        db_module.init_db()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_result_has_market_sentiment_headline_key(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            result = recap_module.build_weekly_recap("2026-03-09")
+        self.assertIn("market_sentiment_headline", result)
+
+    def test_result_has_market_narrative_key(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            result = recap_module.build_weekly_recap("2026-03-09")
+        self.assertIn("market_narrative", result)
+
+    def test_both_narrative_functions_called(self):
+        with patch("recap.generate_narrative", return_value="spending text") as mock_spend, \
+             patch("recap.generate_market_narrative", return_value={"headline": "h", "narrative": "m"}) as mock_market:
+            result = recap_module.build_weekly_recap("2026-03-09")
+        mock_spend.assert_called_once()
+        mock_market.assert_called_once()
+        self.assertEqual(result["narrative"], "spending text")
+        self.assertEqual(result["market_sentiment_headline"], "h")
+        self.assertEqual(result["market_narrative"], "m")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ so the path is stable regardless of working directory.
 """
 
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +33,10 @@ def init_db() -> None:
                 custom_category TEXT,
                 account_id      TEXT,
                 pending         INTEGER,
-                imported_at     TEXT
+                imported_at     TEXT,
+                hidden          INTEGER NOT NULL DEFAULT 0,
+                custom_name          TEXT,
+                custom_merchant_name TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -88,7 +92,8 @@ def init_db() -> None:
                 subtype        TEXT,
                 mask           TEXT,
                 institution    TEXT,
-                token_hash     TEXT
+                token_hash     TEXT,
+                is_manual      INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS rules (
@@ -140,6 +145,22 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE categories ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE transactions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE transactions ADD COLUMN custom_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE transactions ADD COLUMN custom_merchant_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE accounts ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -222,6 +243,37 @@ def delete_transactions(ids: list[str]) -> None:
         )
 
 
+def hide_transaction(transaction_id: str) -> None:
+    """Soft-hide a transaction. It will be excluded from budget views and ML reports."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE transactions SET hidden = 1 WHERE transaction_id = ?",
+            (transaction_id,),
+        )
+
+
+def unhide_transaction(transaction_id: str) -> None:
+    """Un-hide a previously hidden transaction."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE transactions SET hidden = 0 WHERE transaction_id = ?",
+            (transaction_id,),
+        )
+
+
+def get_hidden_transaction_ids(transaction_ids: list[str]) -> set[str]:
+    """Return the subset of the given IDs that are hidden."""
+    if not transaction_ids:
+        return set()
+    placeholders = ",".join("?" * len(transaction_ids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT transaction_id FROM transactions WHERE hidden = 1 AND transaction_id IN ({placeholders})",
+            transaction_ids,
+        ).fetchall()
+    return {r["transaction_id"] for r in rows}
+
+
 def query_transactions(
     start_date: str, end_date: str, category: str = "", account_id: str = ""
 ) -> list[dict]:
@@ -244,6 +296,7 @@ def query_transactions(
             FROM transactions t
             LEFT JOIN accounts a ON t.account_id = a.account_id
             WHERE t.date BETWEEN ? AND ?
+              AND t.hidden = 0
     """
     params: list = [start_date, end_date]
 
@@ -277,6 +330,36 @@ def set_custom_category(transaction_id: str, category: str) -> bool:
         cursor = conn.execute(
             "UPDATE transactions SET custom_category = ? WHERE transaction_id = ?",
             (category, transaction_id),
+        )
+    return cursor.rowcount > 0
+
+
+def set_transaction_name(
+    transaction_id: str,
+    name: str | None,
+    merchant_name: str | None,
+) -> bool:
+    """
+    Set custom_name and/or custom_merchant_name for a transaction.
+
+    Pass None for either argument to leave that field unchanged.
+    Returns True if the transaction was found, False otherwise.
+    """
+    if name is None and merchant_name is None:
+        return False
+    parts: list[str] = []
+    params: list = []
+    if name is not None:
+        parts.append("custom_name = ?")
+        params.append(name)
+    if merchant_name is not None:
+        parts.append("custom_merchant_name = ?")
+        params.append(merchant_name)
+    params.append(transaction_id)
+    with _conn() as conn:
+        cursor = conn.execute(
+            f"UPDATE transactions SET {', '.join(parts)} WHERE transaction_id = ?",
+            params,
         )
     return cursor.rowcount > 0
 
@@ -410,6 +493,7 @@ def get_uncategorized(limit: int = 50) -> list[dict]:
             """
             SELECT * FROM transactions
             WHERE custom_category IS NULL
+              AND hidden = 0
             ORDER BY date DESC
             LIMIT ?
             """,
@@ -506,6 +590,7 @@ def upsert_accounts(rows: list[dict]) -> None:
                 mask          = excluded.mask,
                 institution   = excluded.institution,
                 token_hash    = excluded.token_hash
+            WHERE accounts.is_manual = 0
             """,
             [
                 (
@@ -593,6 +678,7 @@ def get_spending_summary(month: str) -> list[dict]:
             WHERE date LIKE ?
               AND amount > 0
               AND pending = 0
+              AND hidden = 0
             GROUP BY category
             ORDER BY total DESC
             """,
@@ -833,8 +919,8 @@ def get_week_spending(week_start: str, week_end: str) -> dict:
             by_day[tx_date] = round(by_day.get(tx_date, 0.0) + amt, 2)
             cat_totals[category] = round(cat_totals.get(category, 0.0) + amt, 2)
             cat_txs.setdefault(category, []).append({
-                "name": r.get("name") or "",
-                "merchant_name": r.get("merchant_name") or "",
+                "name": r.get("custom_name") or r.get("name") or "",
+                "merchant_name": r.get("custom_merchant_name") or r.get("merchant_name") or "",
                 "amount": amt,
                 "date": tx_date,
             })
@@ -852,6 +938,90 @@ def get_week_spending(week_start: str, week_end: str) -> dict:
         "by_day": {d: round(v, 2) for d, v in by_day.items()},
         "by_category": by_category,
     }
+
+
+# ---------------------------------------------------------------------------
+# Manual accounts
+# ---------------------------------------------------------------------------
+
+def create_manual_account(
+    name: str,
+    account_type: str,
+    subtype: str,
+    balance: float,
+    institution: str = "",
+) -> str:
+    """
+    Create a manually managed account and record its first balance snapshot.
+    Returns the new account_id (prefixed with 'manual_').
+    """
+    account_id = "manual_" + uuid.uuid4().hex
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO accounts
+                (account_id, name, official_name, type, subtype, mask, institution, token_hash, is_manual)
+            VALUES (?, ?, '', ?, ?, '', ?, '', 1)
+            """,
+            (account_id, name, account_type, subtype, institution),
+        )
+    upsert_balance_snapshot(account_id, balance, balance, "USD", account_type, subtype)
+    return account_id
+
+
+def update_manual_account_balance(account_id: str, balance: float) -> bool:
+    """
+    Record an updated balance for a manual account (inserts a new snapshot).
+    Returns False if the account doesn't exist or isn't manual.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT type, subtype FROM accounts WHERE account_id = ? AND is_manual = 1",
+            (account_id,),
+        ).fetchone()
+    if not row:
+        return False
+    upsert_balance_snapshot(account_id, balance, balance, "USD", row["type"], row["subtype"])
+    return True
+
+
+def get_manual_accounts() -> list[dict]:
+    """Return all manual accounts with their latest balance snapshot."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.account_id, a.name, a.type, a.subtype, a.institution,
+                   s.balance, s.snapped_at
+            FROM accounts a
+            LEFT JOIN balance_snapshots s ON s.account_id = a.account_id
+            LEFT JOIN (
+                SELECT account_id, MAX(snapped_at) AS latest
+                FROM balance_snapshots
+                GROUP BY account_id
+            ) latest ON s.account_id = latest.account_id AND s.snapped_at = latest.latest
+            WHERE a.is_manual = 1
+              AND (s.id IS NULL OR s.snapped_at = latest.latest)
+            ORDER BY a.institution, a.name
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_manual_account(account_id: str) -> bool:
+    """
+    Delete a manual account and all its balance snapshots.
+    Returns False if the account doesn't exist or isn't manual.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT account_id FROM accounts WHERE account_id = ? AND is_manual = 1",
+            (account_id,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM balance_snapshots WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
+    return True
 
 
 def get_net_worth_history(week_start: str, week_end: str) -> dict:

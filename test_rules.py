@@ -107,6 +107,154 @@ class TestRules(unittest.TestCase):
         self.assertEqual(cats["tx2"], "Transport")
 
 
+class TestHideTransaction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        db_module.DB_PATH = Path(self.tmp.name)
+        db_module.init_db()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _tx(self, tx_id, name="Coffee Shop", amount=5.0):
+        return {
+            "transaction_id": tx_id,
+            "date": "2026-03-01",
+            "name": name,
+            "merchant_name": "",
+            "amount": amount,
+            "plaid_category": "FOOD_AND_DRINK",
+            "account_id": "acc1",
+            "pending": False,
+        }
+
+    def test_hide_transaction(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        db_module.hide_transaction("tx1")
+        import sqlite3
+        with sqlite3.connect(db_module.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT hidden FROM transactions WHERE transaction_id = 'tx1'").fetchone()
+        self.assertEqual(row["hidden"], 1)
+
+    def test_unhide_transaction(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        db_module.hide_transaction("tx1")
+        db_module.unhide_transaction("tx1")
+        import sqlite3
+        with sqlite3.connect(db_module.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT hidden FROM transactions WHERE transaction_id = 'tx1'").fetchone()
+        self.assertEqual(row["hidden"], 0)
+
+    def test_query_transactions_excludes_hidden(self):
+        db_module.upsert_transactions([self._tx("tx1"), self._tx("tx2", name="Gym")])
+        db_module.hide_transaction("tx1")
+        results = db_module.query_transactions("2026-03-01", "2026-03-01")
+        ids = [r["transaction_id"] for r in results]
+        self.assertNotIn("tx1", ids)
+        self.assertIn("tx2", ids)
+
+    def test_get_uncategorized_excludes_hidden(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        db_module.hide_transaction("tx1")
+        results = db_module.get_uncategorized()
+        self.assertEqual(results, [])
+
+    def test_get_hidden_transaction_ids(self):
+        db_module.upsert_transactions([self._tx("tx1"), self._tx("tx2", name="Gym")])
+        db_module.hide_transaction("tx1")
+        hidden = db_module.get_hidden_transaction_ids(["tx1", "tx2"])
+        self.assertEqual(hidden, {"tx1"})
+
+    def test_get_hidden_transaction_ids_empty_input(self):
+        result = db_module.get_hidden_transaction_ids([])
+        self.assertEqual(result, set())
+
+
+class TestSetTransactionName(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        db_module.DB_PATH = Path(self.tmp.name)
+        db_module.init_db()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _tx(self, tx_id, name="STARBUCKS", merchant_name="Starbucks"):
+        return {
+            "transaction_id": tx_id,
+            "date": "2026-03-01",
+            "name": name,
+            "merchant_name": merchant_name,
+            "amount": 6.50,
+            "plaid_category": "FOOD_AND_DRINK",
+            "account_id": "acc1",
+            "pending": False,
+        }
+
+    def _row(self, tx_id):
+        import sqlite3
+        with sqlite3.connect(db_module.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(
+                "SELECT name, merchant_name, custom_name, custom_merchant_name "
+                "FROM transactions WHERE transaction_id = ?",
+                (tx_id,),
+            ).fetchone()
+
+    def test_update_custom_name_only(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        ok = db_module.set_transaction_name("tx1", "Starbucks Coffee", None)
+        self.assertTrue(ok)
+        row = self._row("tx1")
+        self.assertEqual(row["custom_name"], "Starbucks Coffee")
+        self.assertIsNone(row["custom_merchant_name"])
+        self.assertEqual(row["name"], "STARBUCKS")  # original preserved
+
+    def test_update_custom_merchant_name_only(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        ok = db_module.set_transaction_name("tx1", None, "Starbucks Corp")
+        self.assertTrue(ok)
+        row = self._row("tx1")
+        self.assertIsNone(row["custom_name"])
+        self.assertEqual(row["custom_merchant_name"], "Starbucks Corp")
+        self.assertEqual(row["merchant_name"], "Starbucks")  # original preserved
+
+    def test_update_both_fields(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        ok = db_module.set_transaction_name("tx1", "Sbux", "Sbux Inc")
+        self.assertTrue(ok)
+        row = self._row("tx1")
+        self.assertEqual(row["custom_name"], "Sbux")
+        self.assertEqual(row["custom_merchant_name"], "Sbux Inc")
+
+    def test_returns_false_for_unknown_transaction(self):
+        ok = db_module.set_transaction_name("nonexistent", "X", None)
+        self.assertFalse(ok)
+
+    def test_returns_false_when_both_none(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        ok = db_module.set_transaction_name("tx1", None, None)
+        self.assertFalse(ok)
+
+    def test_allows_empty_string_name(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        ok = db_module.set_transaction_name("tx1", "", None)
+        self.assertTrue(ok)
+        row = self._row("tx1")
+        self.assertEqual(row["custom_name"], "")
+
+    def test_original_name_preserved_after_set(self):
+        db_module.upsert_transactions([self._tx("tx1")])
+        db_module.set_transaction_name("tx1", "Custom Name", "Custom Merchant")
+        row = self._row("tx1")
+        self.assertEqual(row["name"], "STARBUCKS")
+        self.assertEqual(row["merchant_name"], "Starbucks")
+
+
 if __name__ == "__main__":
     unittest.main()
 
